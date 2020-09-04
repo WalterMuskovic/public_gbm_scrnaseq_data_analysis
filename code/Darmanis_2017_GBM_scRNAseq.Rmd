@@ -1,0 +1,633 @@
+---
+title: "Analysis of Darmanis et al, Cell Reports, 2017 glioblastoma scRNA-seq data"
+author: "Walter Muskovic"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    theme: journal
+    df_print: paged
+    toc: true
+    toc_float: true
+    collapsed: false
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+In this document I'll be downloading and processing the scRNA-seq data produced by Darmanis et al in their [2017 Cell Reports study](https://doi.org/10.1016/j.celrep.2017.10.030), in which they use scRNA-seq to examine stromal and neoplastic cells from the core and periphery of four glioblastoma tumour samples.
+
+The document will be split into the following sections:
+
+  1. [Introduction](#anchor_1) - Overview of the document and comments on reproducibility
+  2. [Data pre-processing](#anchor_2) - We download the counts matrix provided by the authors and re-create it from the raw data
+  3. [Data analysis](#anchor_3) - Some preliminary analysis; normalisation, clustering and plotting
+
+The source R Markdown document is available here: 
+
+```{r embed_Rmd, echo=FALSE}
+# Embed a copy of the Rmd source file in the HTML output
+xfun::embed_file('code/Darmanis_2017_GBM_scRNAseq.Rmd')
+```
+
+# Introduction {#anchor_1}
+
+This document was created to gain familiarity with glioblastoma scRNA-seq datasets and scRNA-seq data analysis in general. All of the data and software used in this analysis are freely available - links to software and datasets are provided in the relevant sections. 
+
+In additon to caching code chunks, throughout the document you'll notice statements along the lines of `if(!file.exists(here("data/large_file.tsv"))){...}`. I included these to avoid re-downloading large files and as a compromise to prevent unreasonably long running times when knitting the R Markdown document. These are generally included in code chunks written to produce intermediate files. 
+
+To visualise intermediate BAM and BED files produced throughout the analysis you could use a genome browser such as the Broad Institute's [IGV](https://software.broadinstitute.org/software/igv/).
+
+# Data pre-processing {#anchor_2}
+
+## Load required R packages and check versions
+Start by loading any R packages that will be required throughout the analysis.
+```{r load_packages, warning=FALSE}
+suppressMessages(library(tidyverse))
+suppressMessages(library(purrr))
+suppressMessages(library(GEOquery))
+suppressMessages(library(Seurat))
+suppressMessages(library(rtracklayer))
+suppressMessages(library(GenomicRanges))
+suppressMessages(library(clustree))
+```
+
+## Download GSE84465 metadata and count matrix
+The data for this project was uploaded to NCBI GEO and is available at accession [GSE84465](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE84465).
+```{r get_GSE84465, message=FALSE, warning=FALSE, tidy=TRUE, cache=TRUE}
+# Download GSE84465
+if(!file.exists("data/Darmanis_2017/GSE84465_series_matrix.txt.gz")){
+  dir.create("data/Darmanis_2017")
+  gse <- getGEO(GEO = "GSE84465",  destdir = "data/Darmanis_2017", GSEMatrix = TRUE)
+}
+gse <- getGEO(filename = "data/Darmanis_2017/GSE84465_series_matrix.txt.gz", GSEMatrix = TRUE)
+gse <- pData(gse)
+# Take a quick look
+head(gse)
+
+# Get GSE84465_GBM_All_data.csv.gz if not already done
+if(!file.exists("data/Darmanis_2017/GSE84465_GBM_All_data.csv.gz")){
+  getGEOSuppFiles(GEO="GSE84465", baseDir = "data/Darmanis_2017", makeDirectory = FALSE, fetch_files = TRUE, filter_regex = "All_data")
+}
+# Import counts
+counts <- read.table('data/Darmanis_2017/GSE84465_GBM_All_data.csv.gz', sep=" ", header=TRUE, stringsAsFactors=FALSE, check.names = FALSE)
+head(counts)
+```
+
+## Download and process SRA files
+Download SRA files (SRR3934349 to SRR3937937) and extract fastq.
+```{bash, eval=FALSE}
+#!/bin/bash
+#$ -S /bin/bash
+#$ -pe smp 4
+#$ -cwd
+#$ -V
+#$ -q short.q
+#$ -r yes
+#$ -l mem_requested=8G
+#$ -N extract_fastq
+
+# Quick note: there are 3589 SRA files (SRR3934349 to SRR3937937) we want to download and process. Each file corresponds to a cell processed with the Smart-seq2 protocol.
+
+# Activate sra-tools
+conda activate sra-tools
+
+# Prefetch SRA files, in batches of 50 files at a time
+start_var=3934349
+for i in {1..72}
+do
+ let "end_var=start_var+49"
+ for accession in `seq $start_var $end_var`
+ do
+  prefetch -o /share/ScratchGeneral/walmus/"SRR${accession}" "SRR${accession}" &
+ done
+wait
+ let "start_var=start_var+50"
+done
+
+# Extract fastq files using fastq-dump.2.10.0, in batches of 50 files at a time
+start_var=3934349
+for i in {1..72}
+do
+ let "end_var=start_var+49"
+ for accession in `seq $start_var $end_var`
+ do
+  fastq-dump.2.10.0 --gzip --split-3 -O /share/ScratchGeneral/walmus/ /share/ScratchGeneral/walmus/"SRR${accession}" &
+ done
+wait
+ let "start_var=start_var+50"
+done
+
+# When fastq-dump is applied to SRR3936341, only one file is produced: SRR3936341.fastq.gz. We will remove this cell, leaving us with 3588
+rm SRR3936341.fastq.gz SRR3936341
+
+# Check how many lines are present in sample_name_R1.fastq.gz and sample_name_R2.fastq.gz files - should be equal.
+cd /share/ScratchGeneral/walmus/
+touch temp_read_counts.txt
+for accession in {3934349..3937937}
+do
+    count1=$(zcat /share/ScratchGeneral/walmus/"SRR${accession}_1.fastq.gz" | wc -l)
+    count2=$(zcat /share/ScratchGeneral/walmus/"SRR${accession}_2.fastq.gz" | wc -l)
+    if [ "$count1" == "$count2" ]; then
+      echo "SRR${accession} reads are equal" >> temp_read_counts.txt
+    else
+        echo "SRR${accession} reads are not equal" >> temp_read_counts.txt
+    fi
+done
+cat temp_read_counts.txt | grep "reads are not equal" | wc -l # confirmed 0
+rm temp_read_counts.txt
+```
+
+## fastQC
+```{bash, eval=FALSE}
+#!/bin/bash
+#$ -S /bin/bash
+#$ -pe smp 4
+#$ -cwd
+#$ -V
+#$ -q short.q
+#$ -r yes
+#$ -l mem_requested=8G
+#$ -N fastQC
+
+conda activate fastqc
+cd /share/ScratchGeneral/walmus/
+mkdir /share/ScratchGeneral/walmus/fastqc
+# Shoudn't have to do this in a loop but when i supplied *.fastq.gz, which should capture all of the fastq files, I kept getting an error that it was running out of memory. Process in batches of 50 files at a time.
+start_var=3934349
+for i in {1..72}
+do
+ let "end_var=start_var+49"
+ for accession in `seq $start_var $end_var`
+ do
+    fastqc --outdir /share/ScratchGeneral/walmus/fastqc "SRR${accession}_1.fastq.gz" &
+    fastqc --outdir /share/ScratchGeneral/walmus/fastqc "SRR${accession}_2.fastq.gz" &
+ done
+wait
+ let "start_var=start_var+50"
+done
+
+# Generate multiqc report
+multiqc share/ScratchGeneral/walmus/fastqc/
+```
+
+## Align with STAR
+```{bash, eval=FALSE}
+#!/bin/bash
+#$ -S /bin/bash
+#$ -pe smp 16
+#$ -cwd
+#$ -V
+#$ -q short.q
+#$ -r yes
+#$ -l mem_requested=4G
+#$ -N STAR
+
+# Get genome sequence
+mkdir /share/ScratchGeneral/walmus/STAR
+cd /share/ScratchGeneral/walmus/STAR
+wget -P /share/ScratchGeneral/walmus/STAR ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_32/GRCh38.primary_assembly.genome.fa.gz
+md5sum GRCh38.primary_assembly.genome.fa.gz | grep a08878cc9076dfa98908123e0069007f
+gunzip GRCh38.primary_assembly.genome.fa.gz
+
+# Get ERCC spike-in fasta and gtf
+wget -P /share/ScratchGeneral/walmus/STAR https://assets.thermofisher.com/TFS-Assets/LSG/manuals/ERCC92.zip
+unzip ERCC92.zip ; rm ERCC92.zip
+
+# Get genome annotation
+wget -P /share/ScratchGeneral/walmus/STAR ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_32/gencode.v32.annotation.gtf.gz
+md5sum gencode.v32.annotation.gtf.gz | grep 6e5ca615187dfe3775a98e406fed69e4   
+gunzip gencode.v32.annotation.gtf.gz
+
+# Combine genome and ERCC files
+cat gencode.v32.annotation.gtf ERCC92.gtf > GRCh38_ERCC.gtf
+cat GRCh38.primary_assembly.genome.fa ERCC92.fa > GRCh38_ERCC.fa
+
+# Create STAR index
+conda activate star
+STAR --runMode genomeGenerate --genomeFastaFiles GRCh38_ERCC.fa --sjdbGTFfile GRCh38_ERCC.gtf --sjdbOverhang 64 --runThreadN 16 --genomeDir /share/ScratchGeneral/walmus/STAR --outFileNamePrefix STAR_GRCh38
+```
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#$ -S /bin/bash
+#$ -pe smp 24
+#$ -cwd
+#$ -V
+#$ -q short.q
+#$ -r yes
+#$ -l mem_requested=2G
+#$ -N STAR
+
+conda activate star
+# Align fastq files
+for accession in {3934349..3937937}
+do
+# check fastq file exists first
+if [ -f "/share/ScratchGeneral/walmus/Darmanis_2017/fastq/SRR${accession}_1.fastq.gz" ]; then
+     STAR --genomeDir /share/ScratchGeneral/walmus/STAR --readFilesIn /share/ScratchGeneral/walmus/Darmanis_2017/fastq/SRR${accession}_1.fastq.gz /share/ScratchGeneral/walmus/Darmanis_2017/fastq/SRR${accession}_2.fastq.gz \
+      --readFilesCommand zcat --runThreadN 16 --genomeLoad LoadAndKeep --limitBAMsortRAM 400000000000\
+      --outSAMunmapped Within --outSAMtype BAM SortedByCoordinate \
+      --quantMode GeneCounts \
+      --outFilterMultimapNmax 20 --alignSJoverhangMin 8 --alignSJDBoverhangMin 1 --outFilterMismatchNoverLmax 0.04 --alignIntronMin 20 --alignIntronMax 1000000 --alignMatesGapMax 1000000 --outSAMstrandField intronMotif \
+      --outFileNamePrefix /share/ScratchGeneral/walmus/Darmanis_2017/alignments/SRR${accession}
+fi
+done
+# unload genome from memory
+STAR --genomeDir /share/ScratchGeneral/walmus/STAR --genomeLoad Remove
+```
+
+## Quantify with featureCounts
+```{bash, eval=FALSE}
+#!/bin/bash
+#$ -S /bin/bash
+#$ -pe smp 8
+#$ -q short.q
+#$ -N featureCounts
+#$ -V
+#$ -cwd
+#$ -b n
+#$ -t 3934349-3937937:1
+
+# Quantify with featureCounts
+# check BAM file exists first
+if [ -f "/share/ScratchGeneral/walmus/Darmanis_2017/alignments/SRR${SGE_TASK_ID}Aligned.sortedByCoord.out.bam" ]; then
+featureCounts -T 8 -p -t exon -g gene_id -a /share/ScratchGeneral/walmus/STAR/gencode.v32.annotation.gtf -o /share/ScratchGeneral/walmus/Darmanis_2017/counts/SRR${SGE_TASK_ID}_counts.txt /share/ScratchGeneral/walmus/Darmanis_2017/alignments/SRR${SGE_TASK_ID}Aligned.sortedByCoord.out.bam
+fi
+```
+```{bash}
+cd /share/ScratchGeneral/walmus/Darmanis_2017/counts/
+# Get counts from each file
+ls -1 *_counts.txt | parallel 'cat {} | sed '1d' | cut -f7 {} > {/.}_clean.txt' 
+# Get gene IDs
+ls -1  *_counts.txt | head -1 | xargs cut -f1 > genes.txt
+# Get gene length
+ls -1  *_counts.txt | head -1 | xargs cut -f6 > gene_length.txt
+# Combine counts in one file - takes a few minutes. Paste complains "Too many open files" if we try use it on all the counts files at once.
+touch final.res
+for f in *_counts_clean.txt; do cat final.res | paste - $f >temp; cp temp final.res; done; rm temp
+# Combine gene IDs, gene lengths and counts in one file
+paste genes.txt gene_length.txt final.res > featureCounts.txt
+```
+Combine the output from featureCounts and convert counts to TPM.
+```{r combine_featureCounts_ouput}
+count_files<- list.files("data/", pattern = "_counts.txt", full.names = T)
+read_in_feature_counts<- function(file){
+        cnt <- read_tsv(file, col_names =T, comment = "#")
+        cnt <- cnt %>% dplyr::select(-Chr, -Start, -End, -Strand, -Length)
+        return(cnt)
+}
+raw_counts <- map(f_files, read_in_feature_counts)
+raw_counts_df <- purrr::reduce(raw_counts, inner_join)
+
+# From Mike Love
+gene.length <- c()
+x <- raw_counts_df / gene.length
+tpm.mat <- t( t(x) * 1e6 / colSums(x) )
+```
+
+## MultiQC
+Run multiqc again - should capture the STAR aligner and featureCounts data as well. Could include some plots in this document.
+```{bash, eval=FALSE}
+cd /share/ScratchGeneral/walmus/Darmanis_2017
+conda activate fastqc
+multiqc .
+```
+
+# Data analysis {#anchor_3}
+
+## Counts to TPM
+The data provided by the authors a counts matrix. We will convert this to TPM.
+```{r, cache=TRUE, warning=FALSE}
+# Import annotation
+GENCODE <- readGFF("data/Darmanis_2017/GRCh38_ERCC.gtf", filter=list(type=c("exon")), version = 2) %>%
+  filter(transcript_type == "protein_coding" | source == "ERCC") %>%
+  mutate(gene_name = if_else(source == "ERCC", gene_id, gene_name))
+# Make GRangesList
+gene.lengths <- makeGRangesListFromDataFrame(GENCODE, split.field = "gene_name", names.field = "gene_name")
+# Get lengths of exons
+gene.lengths <- lapply(gene.lengths, reduce)
+# Get gene lengths
+gene.lengths <- sapply(gene.lengths, function(x) sum(width(x)))
+
+# How many genes in matrix?
+nrow(counts)
+# Restrict to genes with matching name
+counts <- counts[row.names(counts)%in%names(gene.lengths),]
+gene.lengths <- gene.lengths[names(gene.lengths)%in%row.names(counts)]
+# We lose a lot of genes doing this
+nrow(counts)
+# Check the order is the same
+sum(names(gene.lengths)!=row.names(counts))==0
+
+# create a TPM matrix by dividing each column of the counts matrix by our estimate of the gene length
+tpm <- counts / gene.lengths
+# transform such that the columns sum to 1 million
+tpm <- t( t(tpm) * 1e6 / colSums(tpm) )
+```
+
+Now we really need to get stuck into getting familiar with the basic steps of a scRNA-seq experiment data analysis.
+```{r create_seurat, message=FALSE, warning=FALSE}
+# Initialize the Seurat object with the raw (non-normalized data).
+gbm <- CreateSeuratObject(counts = tpm, project = "Darmanis_2017", min.cells = 3, min.features = 200)
+gbm
+```
+Now we can proceed through the standard pre-processing workflow for scRNA-seq data in Seurat. These steps are; 
+ - the selection and filtration of cells based on QC metrics
+ - data normalization and scaling
+ - the detection of highly variable features
+
+## QC
+Visualise QC metrics, and use these to filter cells.
+```{r qc, fig.height=7, fig.width=13}
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+gbm[["percent.ERCC"]] <- PercentageFeatureSet(object = gbm, pattern = "^ERCC-")
+
+# Show QC metrics for the first 5 cells
+head(x = gbm@meta.data, 5)
+
+#Visualize QC metrics as a violin plot
+VlnPlot(object = gbm, features = c("nFeature_RNA", "percent.ERCC"), ncol = 2)
+
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+FeatureScatter(object = gbm, feature1 = "nFeature_RNA", feature2 = "percent.ERCC")
+
+# Create variable to match rows from gse to rows in gbm (we filtered cells during QC)
+metadata_id <- match(names(gbm$orig.ident), as.character(gse$description.1))
+
+# Add metadata to gbm
+gbm[["plate.ID"]] <- str_remove_all(as.character(gse$characteristics_ch1.1), "plate id: ")[metadata_id]
+gbm[["well.ID"]] <- str_remove_all(as.character(gse$characteristics_ch1.2), "well: ")[metadata_id]
+gbm[["tissue"]] <- str_remove_all(as.character(gse$characteristics_ch1.3), "tissue: ")[metadata_id]
+gbm[["patient.ID"]] <- str_remove_all(as.character(gse$characteristics_ch1.4), "patient id: ")[metadata_id]
+gbm[["tsne.cluster"]] <- str_remove_all(as.character(gse$characteristics_ch1.5), "tsne cluster: ")[metadata_id]
+gbm[["cell.type"]] <- str_remove_all(as.character(gse$characteristics_ch1.6), "cell type: ")[metadata_id]
+gbm[["neoplastic"]] <- str_remove_all(as.character(gse$characteristics_ch1.7), "neoplastic: ")[metadata_id]
+gbm[["selection"]] <- str_remove_all(as.character(gse$characteristics_ch1.8), "selection: ")[metadata_id]
+rm(metadata_id)
+```
+
+I'm not sure what to make of the plot of % ERCC vs the number of features detected (TPM>0 I assume). My best guess is that they added way more ERCC than was intended and that samples with less spike-ins had more sequencing reads left to detect genes. There's no mention or ERCC spike-in sequences in the paper or supplementary material.
+
+```{r qc2}
+# Filter cells that have unique feature counts over 4,000 or less than 1000 or ERCC % > 75
+gbm <- subset(x = gbm, subset = nFeature_RNA > 1000 & nFeature_RNA < 4000 & percent.ERCC < 75)
+gbm
+# Get just the neoplastic cells from all four patients
+neoplastic <- subset(gbm, subset = neoplastic == "Neoplastic")
+```
+
+## Normalizing the data
+After removing unwanted cells from the dataset, the next step is to normalize the data.We will use the default global-scaling normalization method "LogNormalize" that normalizes the feature expression measurements for each cell by the total expression, multiplies this by a scale factor (10,000 by default), and log-transforms the result. 
+Normalized values are stored in `gbm[["RNA"]]@data`.
+
+```{r normalize}
+gbm <- NormalizeData(object = gbm, normalization.method = "LogNormalize", scale.factor = 1e4)
+# Look at a few genes
+head(gbm[["RNA"]]@data)[,1:10]
+```
+
+## Identification of highly variable features (feature selection)
+I'm just following the steps outlined in the Seurat tutorial, and the next procedure is to identify highly variable genes. In the normlisation step we log-transformed the data - the range of values is between `r range(gbm[["RNA"]]@data)`, but we haven't performed any scaling yet. From what we saw above, the ERCC spike-ins make up a large percentage of the reads and vary from cell to cell, so we should be mindful of them.
+
+We want to idetnify a subset of features that exhibit high cell-to-cell variation in the dataset (i.e, they are highly expressed in some cells, and lowly expressed in others). Focusing on these genes in downstream analysis helps to highlight biological signal in single-cell datasets.
+
+Our procedure in Seurat3 is described in detail [here](https://www.biorxiv.org/content/early/2018/11/02/460147.full.pdf), and improves on previous versions by directly modeling the mean-variance relationship inherent in single-cell data, and is implemented in the `FindVariableFeatures` function. By default, we return 2,000 features per dataset. These will be used in downstream analysis, like PCA.
+
+```{r var_features, fig.height=5, fig.width=11}
+# Identify 2000 most variable genes
+gbm <- FindVariableFeatures(object = gbm, selection.method = 'vst', nfeatures = 2000)
+# As expected, ERCC spike-ins are identified
+str_subset(VariableFeatures(object = gbm), "ERCC-")
+# Remove the spike-in sequences
+VariableFeatures(object = gbm) <- str_subset(VariableFeatures(object = gbm), "ERCC-", negate = TRUE)
+
+# Identify the 10 most highly variable genes
+top10 <- head(x = VariableFeatures(object = gbm), 10)
+
+# plot variable features with and without labels
+plot1 = VariableFeaturePlot(object = gbm)
+LabelPoints(plot = plot1, points = top10, repel = TRUE)
+```
+
+## Scaling the data
+Next, we apply a linear transformation ('scaling') that is a standard pre-processing step prior to dimensional reduction techniques like PCA. The `ScaleData` function:
+
+* Shifts the expression of each gene, so that the mean expression across cells is 0
+* Scales the expression of each gene, so that the variance across cells is 1
+    + This step gives equal weight in downstream analyses, so that highly-expressed genes do not dominate
+* The results of this are stored in `pbmc[["RNA"]]@scale.data`
+
+```{r regress, fig.height=7, fig.width=11, results='hide', cache=TRUE}
+all.genes <- rownames(x = gbm)
+#gbm <- ScaleData(object = gbm, features = all.genes)
+
+# I modified this step to regress out the percentage of reads that map to ERCC spike-ins, as it seems to improve the seperation of the neoplastic cell clusters downstream
+gbm <- ScaleData(object = gbm, features = all.genes, vars.to.regress = 'percent.ERCC')
+
+# Compare unscaled data:
+gbm[["RNA"]]@data[1:10,1:10]
+# and scaled data:
+gbm[["RNA"]]@scale.data[1:10, 1:10]
+```
+
+## Perform linear dimensional reduction
+
+Next we perform PCA on the scaled data. By default, only the previously determined variable features are used as input, but can be defined using `features` argument if you wish to choose a different subset.
+
+```{r pca,results='hide'}
+gbm <- RunPCA(object = gbm, features = VariableFeatures(object = gbm))
+```
+
+Seurat provides several useful ways of visualizing both cells and features that define the PCA, including `VizDimReduction`, `DimPlot`, and `DimHeatmap`
+
+```{r pca_viz, message=TRUE}
+# Examine and visualize PCA results a few different ways
+print(x = gbm[['pca']], dims = 1:5, nfeatures = 5)
+VizDimLoadings(object = gbm, dims = 1:2, reduction = 'pca')
+DimPlot(object = gbm, reduction = 'pca', dims = c(1, 2))
+```
+
+Before going further, I want to do some quick sanity checks. We will use the `gse` data frame which contains sample information to add some metadata to the `gbm` Seurat object.
+
+```{r pca_viz2}
+# Show QC metrics for the first 5 cells
+head(x = gbm@meta.data, 5)
+
+# Colour cells by type
+DimPlot(object = gbm, reduction = 'pca', dims = c(1, 2), group.by = "cell.type")
+
+# Colour cells by type and split by patient
+DimPlot(object = gbm, reduction = 'pca', dims = c(1, 2), group.by = "cell.type", split.by = "patient.ID", ncol=2)
+```
+
+Using the first two principal components, cells seperate by type which is good to see. When it comes to the second plot, my understanding is that the `DimPlot` function is just retreiving from the Seurat object `gbm`, the PCA we generated previously with the command `RunPCA(object = gbm, features = VariableFeatures(object = gbm))`, it's not generating any new PCA. So the princpal components were determined using ALL the cells and if we were to overlay these four plots we would get the original image. This isn't the same thing as splitting the cells by patient, calculating the prinicpal components for each patient and plotting the first two. 
+
+`DimHeatmap` allows for easy exploration of the primary sources of heterogeneity in a dataset, and can be useful when trying to decide which PCs to include for further downstream analyses. Both cells and features are ordered according to their PCA scores. Setting `cells` to a number plots the 'extreme' cells on both ends of the spectrum, which dramatically speeds plotting for large datasets. Though clearly a supervised analysis, we find this to be a valuable tool for exploring correlated feature sets.
+
+```{r single-heatmap}
+DimHeatmap(object = gbm, dims = 1, nfeatures =30, cells = 500, balanced = TRUE)
+```
+
+```{r multi-heatmap, fig.height=12, fig.width=9}
+DimHeatmap(object = gbm, dims = 1:15, cells = 500, balanced = TRUE)
+```
+
+## Determine the 'dimensionality' of the dataset
+
+To overcome the extensive technical noise in any single feature for scRNA-seq data, Seurat clusters cells based on their PCA scores, with each PC essentially representing a 'metafeature' that combines information across a correlated feature set. The top principal components therefore represent a robust compression of the dataset. We need to decide how many PC to include.
+
+In [Macosko *et al*](http://www.cell.com/abstract/S0092-8674(15)00549-8), we implemented a resampling test inspired by the JackStraw procedure. We randomly permute a subset of the data (1% by default) and rerun PCA, constructing a 'null distribution' of feature scores, and repeat this procedure. We identify 'significant' PCs as those who have a strong enrichment of low p-value features.
+
+```{r jackstraw, fig.height=6, fig.width=10, cache=TRUE}
+# NOTE: This process can take a long time for big datasets, comment out for expediency. More approximate techniques such as those implemented in ElbowPlot() can be used to reduce computation time
+gbm <- JackStraw(object = gbm, num.replicate = 100)
+gbm <- ScoreJackStraw(object = gbm, dims = 1:20)
+```
+
+The `JackStrawPlot` function provides a visualization tool for comparing the distribution of p-values for each PC with a uniform distribution (dashed line). 'Significant' PCs will show a strong enrichment of features with low p-values (solid curve above the dashed line). In this case it appears that there is a sharp drop-off in significance after the first 10-12 PCs.
+
+```{r jsplots, fig.height=6, fig.width=10}
+JackStrawPlot(object = gbm, dims = 1:15)
+```
+
+An alternative heuristic method generates an 'Elbow plot': a ranking of principle components based on the percentage of variance explained by each one (`ElbowPlot` function). In this example, we can observe an 'elbow' around PC9-10, suggesting that the majority of true signal is captured in the first 10 PCs. 
+
+```{r elbow_plot, fig.height=6, fig.width=10}
+ElbowPlot(object = gbm, ndims = 30)
+```
+
+Identifying the true dimensionality of a dataset -- can be challenging/uncertain for the user. We therefore suggest these three approaches to consider. The first is more supervised, exploring PCs to determine relevant sources of heterogeneity, and could be used in conjunction with GSEA for example. The second implements a statistical test based on a random null model, but is time-consuming for large datasets, and may not return a clear PC cutoff. The third is a heuristic that is commonly used, and can be calculated instantly.
+
+* We advise users to err on the higher side when choosing this parameter. For example, performing downstream analyses with only 5 PCs does signifcanltly and adversely affect results.
+
+We will try 20 to start off with, but downstream we can try repeat with a different number of PCs (e.g. 5, 20, 30) and see whether the results differ dramatically.
+
+## Cluster the cells
+
+Seurat v3 applies a graph-based clustering approach. Briefly, these methods embed cells in a graph structure - for example a K-nearest neighbor (KNN) graph, with edges drawn between cells with similar feature expression patterns, and then attempt to partition this graph into highly interconnected 'quasi-cliques' or 'communities'. 
+As in PhenoGraph, we first construct a KNN graph based on the euclidean distance in PCA space, and refine the edge weights between any two cells based on the shared overlap in their local neighborhoods (Jaccard similarity). This step is performed using the `FindNeighbors` function, and takes as input the previously defined dimensionality of the dataset (first 11 PCs).
+To cluster the cells, we next apply modularity optimization techniques such as the Louvain algorithm (default) or SLM [[SLM, Blondel *et al*., Journal of Statistical Mechanics]](http://dx.doi.org/10.1088/1742-5468/2008/10/P10008), to iteratively group cells together, with the goal of optimizing the standard modularity function. The `FindClusters` function implements this procedure, and contains a resolution parameter that sets the 'granularity' of the downstream clustering, with increased values leading to a greater number of clusters. We find that setting this parameter between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells. Optimal resolution often increases for larger datasets. The clusters can be found using the `Idents` function.
+
+
+```{r cluster, fig.height=5, fig.width=7}
+gbm <- FindNeighbors(object = gbm, dims = 1:20)
+gbm <- FindClusters(object = gbm, resolution = 0.5)
+
+# Look at cluster IDs of the first 5 cells
+head(x = Idents(object = gbm), 5)
+```
+
+## Run non-linear dimensional reduction (UMAP/tSNE)
+Seurat offers several non-linear dimensional reduction techniques, such as tSNE and UMAP, to visualize and explore these datasets. The goal of these algorithms is to learn the underlying manifold of the data in order to place similar cells together in low-dimensional space. Cells within the graph-based clusters determined above should co-localize on these dimension reduction plots. As input to the UMAP and tSNE, we suggest using the same PCs as input to the clustering analysis.
+
+```{r umap, fig.height=5, fig.width=7}
+gbm <- RunUMAP(object = gbm, dims = 1:20)
+```
+
+```{r umapplot, fig.height=5, fig.width=7}
+# note that you can set `label = TRUE` or use the LabelClusters function to help label individual clusters
+DimPlot(object = gbm, reduction = 'umap', group.by = "cell.type", label = TRUE)
+DimPlot(object = gbm, reduction = 'umap', group.by = "cell.type", split.by = "patient.ID", ncol=2)
+```
+
+From these plots we might infer:
+
+ - there is substanital variation in the neoplastic cell transcriptomes between patient samples
+ - the immune cell population may consist of at least two cell types (large cluster and small cluster)
+ - the vascular cell type might need a closer look - split in three distinct clusters in three of the patient samples
+
+One of the unqiue aspects of this study was that they took samples from the periphery and the tumour core. What if we split samples by tissue?
+```{r umapplot2, fig.height=5, fig.width=7}
+DimPlot(object = gbm, reduction = 'umap', group.by = "cell.type", split.by = "tissue", ncol=2)
+```
+
+From this plot we can see:
+
+ - astrocytes/OPCs are absent/depleted in the tumour core
+ - the number of neoplastic cells detected in the periphery is small
+ - the transcriptome of the immune cell population looks quite different
+
+Another unique aspect of the study was that they used panning with antibodies specific to enrich for different cell types. 
+```{r, fig.height=5, fig.width=7}
+DimPlot(object = gbm, reduction = 'umap', group.by = "cell.type", split.by = "selection", ncol=2)
+```
+This plot is somewhat disturbing. The neoplastic clusters clearly seperate based on the selection procedure. I can't see why this woul 
+
+Have a look to see how cells with different %'s of ERCCs are distributed across the clusters in the UMAP plot. 
+```{r, fig.height=5, fig.width=7}
+FeaturePlot(object = gbm, features = "percent.ERCC", reduction= "umap")
+```
+
+Have a look with the clustree package to see how stable the clusters are as the resolution is increased
+```{r clustree, cache=TRUE, fig.width=12, fig.height=12}
+# Try res from 0 to 1 in increments of 0.05
+windows <- seq(0, 1, by = 0.05)
+for (res in windows){
+  gbm <- FindClusters(gbm, resolution = res, verbose = FALSE)
+}
+# The data is stored as metadata
+head(gbm[[]])
+# Plot cluster tree
+clustree(gbm)
+
+# Add UMAP embeddings 1 and 2 as metadata columns and overlay the clustering tree over the UMAP plot
+gbm[["UMAP_1"]] <- gbm@reductions$umap@cell.embeddings[,1]
+gbm[["UMAP_2"]] <- gbm@reductions$umap@cell.embeddings[,2]
+clustree_overlay(gbm, x_value = "UMAP_1", y_value = "UMAP_2")
+
+# the main overlay plot shows us the tree from above. It can also be useful to see it from the side, showing one of the x or y dimensions against the resolution dimension. 
+# We can get these views by setting the plot_sides option to TRUE. This will return a list of ggplot objects instead of a single plot.
+
+overlay_list <- clustree_overlay(gbm, x_value = "UMAP_1", y_value = "UMAP_2", plot_sides = TRUE)
+names(overlay_list)
+#> [1] "overlay" "x_side"  "y_side"
+overlay_list$x_side
+overlay_list$y_side
+```
+
+We will save the object at this point so that it can easily be loaded back in without having to rerun the computationally intensive steps performed above.
+```{r saveobject, eval=TRUE, cache=TRUE}
+saveRDS(gbm, file = "data/Darmanis_2017/gbm.rds")
+```
+
+## Subset neoplastic cells
+Take a quick look at just the neoplastic cells.
+```{r neoplastic_cells, cache=TRUE}
+# normalize
+neoplastic <- NormalizeData(object = neoplastic, normalization.method = "LogNormalize", scale.factor = 1e4)
+# Identify 2000 most variable genes
+neoplastic <- FindVariableFeatures(object = neoplastic, selection.method = 'vst', nfeatures = 2000)
+VariableFeatures(object = neoplastic) <- str_subset(VariableFeatures(object = neoplastic), "ERCC-", negate = TRUE)
+# Scale
+all.genes <- rownames(x = neoplastic)
+neoplastic <- ScaleData(object = neoplastic, features = all.genes, vars.to.regress = 'percent.ERCC')
+# Run PCA
+neoplastic <- RunPCA(object = neoplastic, features = VariableFeatures(object = neoplastic))
+# Plot PCS
+DimPlot(object = neoplastic, reduction = 'pca', dims = c(1, 2), group.by = "patient.ID")
+# Elbow plot
+ElbowPlot(object = neoplastic, ndims = 30)
+# Find clusters
+neoplastic <- FindNeighbors(object = neoplastic, dims = 1:20)
+neoplastic <- FindClusters(object = neoplastic, resolution = 0.5)
+# Run UMAP
+neoplastic <- RunUMAP(object = neoplastic, dims = 1:20)
+# Plot UMAP
+DimPlot(object = neoplastic, reduction = 'umap', group.by = "patient.ID", label = TRUE)
+
+# Perform cell cycle scoring
+neoplastic <- CellCycleScoring(neoplastic, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes, set.ident = TRUE)
+FeaturePlot(object = neoplastic, features = "S.Score", reduction= "umap")
+FeaturePlot(object = neoplastic, features = "G2M.Score", reduction= "umap")
+DimPlot(object = neoplastic, reduction = 'umap', group.by = "Phase")
+DimPlot(object = neoplastic, reduction = 'umap', group.by = "tissue")
+```
+
+We could go a lot further;
+
+ - exploring variation within neoplastic cells from individual patient samples
+ - examining TCGA-defined GBM expression subtypes
+ - inferring CNV
+
+but I would rather do this with the Neftel et al 2019 dataset, which contains more cells including 10x data, so will leave this here for now.

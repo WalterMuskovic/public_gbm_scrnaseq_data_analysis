@@ -1,0 +1,581 @@
+---
+title: "Analysis of Neftel et al, Cell, 2019 glioblastoma scRNA-seq data"
+author: "Walter Muskovic"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    theme: journal
+    df_print: paged
+    toc: true
+    toc_float: true
+    collapsed: false
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r global_options, include=FALSE}
+#knitr::opts_chunk$set(fig.width=12, fig.height=8, fig.path='Figs/',echo=FALSE, warning=FALSE, message=FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(".."), tidy = TRUE, warning = FALSE, message = FALSE,
+                     cache = TRUE, cache.lazy = FALSE)
+```
+In this document I'll be downloading and processing the scRNA-seq data produced by Neftel et al in their [2019 Cell study](https://doi.org/10.1016/j.cell.2019.06.024), in which they use scRNA-seq to examine 28 glioblastoma tumour samples using both Smart-seq2 and 10x.
+
+The document will be split into the following sections:
+
+  1. [Introduction](#anchor_1) - Overview of the document and comments on reproducibility
+  2. [Download data](#anchor_2) - Download the metadata, SmartSeq2 and 10x TPM matrices from GSE131928
+  3. [Process 10x data](#anchor_3) - Seurat processing of the 10x data
+  4. [Process Smart-seq2 data](#anchor_4) - Seurat processing of the Smart-seq2 data 
+
+The source R Markdown document is available here: 
+
+```{r embed_Rmd, echo=FALSE}
+# Embed a copy of the Rmd source file in the HTML output
+xfun::embed_file('code/Neftel_2019_GBM_scRNAseq.Rmd')
+```
+
+# Introduction {#anchor_1}
+
+This document was created to gain familiarity with glioblastoma scRNA-seq datasets and scRNA-seq data analysis in general. All of the data and software used in this analysis are freely available - links to software and datasets are provided in the relevant sections. 
+
+In additon to caching code chunks, throughout the document you'll notice statements along the lines of `if(!file.exists(here("data/large_file.tsv"))){...}`. I included these to avoid re-downloading large files and as a compromise to prevent unreasonably long running times when knitting the R Markdown document. These are generally included in code chunks written to produce intermediate files. 
+
+# Download data {#anchor_2}
+
+## Load required R packages and check versions
+Start by loading any R packages that will be required throughout the analysis.
+```{r load_packages}
+suppressMessages(library(tidyverse))
+suppressMessages(library(GEOquery))
+suppressMessages(library(readxl))
+suppressMessages(library(Seurat))
+suppressMessages(library(RColorBrewer))
+suppressMessages(library(plotly))
+suppressMessages(library(scales))
+suppressMessages(library(glue))
+```
+
+## Download GSE131928 metadata and TPM matrices
+The data for this project was uploaded to NCBI GEO and is available at accession [GSE131928](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE131928).
+```{r get_GSE131928}
+# Download GSE131928
+if(!file.exists("data/Neftel_2019/GSE131928_series_matrix.txt.gz")){
+  dir.create("data/Neftel_2019")
+  gse <- getGEO(GEO = "GSE131928",  destdir = "data/Neftel_2019", GSEMatrix = TRUE)
+}
+gse <- getGEO(filename = "data/Neftel_2019/GSE131928_series_matrix.txt.gz", GSEMatrix = TRUE)
+# Take a quick look
+head(pData(gse))
+
+
+# Get GSE131928_RAW.tar if not already done
+if(!file.exists("data/Neftel_2019/GSE131928_RAW.tar")){
+  getGEOSuppFiles(GEO="GSE131928", baseDir = "data/Neftel_2019", makeDirectory = FALSE, fetch_files = TRUE)
+  untar("data/Neftel_2019/GSE131928_RAW.tar", exdir="data/Neftel_2019/")
+}
+# Check to see the files we have in the data directory
+list.files("data/Neftel_2019/")
+
+# import metadata
+metadata <-read_excel(path="data/Neftel_2019/GSE131928_single_cells_tumor_name_and_adult_or_peidatric.xlsx", skip = 43)
+
+# Import smartseq2 counts and save out as a Seurat object
+if(!file.exists("data/Neftel_2019/smartseq.rds")){
+  smartseq <- CreateSeuratObject(counts=read.delim("data/Neftel_2019/GSM3828672_Smartseq2_GBM_IDHwt_processed_TPM.tsv.gz", sep = "\t", check.names = FALSE, row.names = 1), project = "Neftel_2019", min.cells = 0, min.features = 0)
+  saveRDS(smartseq, "data/Neftel_2019/smartseq.rds")
+}
+
+# Import 10x counts and save out as a Seurat object
+if(!file.exists("data/Neftel_2019/tenx.rds")){
+  tenx <- CreateSeuratObject(counts=read.delim("data/Neftel_2019/GSM3828673_10X_GBM_IDHwt_processed_TPM.tsv.gz", sep = "\t", check.names = FALSE, row.names = 1), project = "Neftel_2019_10x", min.cells = 3, min.features = 200)
+  saveRDS(tenx, "data/Neftel_2019/tenx.rds")
+}
+```
+
+# Process 10x data {#anchor_3}
+```{r import_tenx_seurat}
+tenx <- readRDS("data/Neftel_2019/tenx.rds")
+```
+## Inspect 10x data
+Have a quick look at what the object contains.
+```{r glance_tenx_seurat}
+# Note: The file name "GSM3828673_10X_GBM_IDHwt_processed_TPM.tsv.gz" suggests the expression values are in TPM, but they shouldn't be because it's 10x count data.
+head(tenx[[]])
+# We can see that the nCount_RNA (colSum of the expression counts) is approximately but not quite 1 million - for TPM it should be 1 million. If we look at this across all of the cells:
+plot(unlist((tenx[["nCount_RNA"]])), col=Idents(tenx))
+# Some cells have much lower values. THere is some variation among samples:
+plot(unlist((tenx[["nCount_RNA"]])), ylim=c(970000, 1E6), col=Idents(tenx))
+# For some reason there is variation wihin cells for the second (red) sample. I don't know why these aren't just raw counts
+
+# Object dimensions
+dim(tenx)
+# Cell identities
+table(Idents(tenx))
+
+# What are the cell names?
+head(colnames(tenx))
+# "102" is a patient sample. How many patient samples?
+table(str_split_fixed(colnames(tenx),"_",2)[,1])
+# The number of cells/pt sample varies quite a bit.
+# How many cells total?
+length(colnames(tenx))
+
+# What do the gene names look like?
+head(rownames(tenx))
+# How many genes?
+length(rownames(tenx))
+
+# Are these adult or pediatric samples?
+metadata %>% filter(!str_detect(metadata$`processed data file`, "Smartseq2")) %>% group_by(`tumour name`, `adult/pediatric`) %>% count %>% select(-n)
+```
+
+Now we can proceed through the standard pre-processing workflow for scRNA-seq data in Seurat. These steps are; 
+ - filtration of cells based on QC metrics
+ - data normalization and scaling
+ - the detection of highly variable features
+
+## QC
+Visualise QC metrics, and use these to filter cells.
+```{r tenx_qc, fig.height=7, fig.width=13}
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+tenx[["percent.mt"]] <- PercentageFeatureSet(object = tenx, pattern = "^MT-")
+
+# Show QC metrics for the first 5 cells
+head(x = tenx@meta.data, 5)
+
+#Visualize QC metrics as a violin plot
+VlnPlot(object = tenx, features = c("nFeature_RNA", "percent.mt"), ncol = 2)
+```
+
+There are a few points that jump out from this plot:
+
+ - There are a small number of cells with a high % of mitochondrial reads - set cut-off to 20%
+ - The samples have clearly been sequenced at different times, to different depths and filtered based on different nFeature cut-offs
+ - Samples 115, 124 and 125 were QC'd together (the cut-offs are the same). Samples 105A and 114 were QC'd together, 118 and 126
+ - Sample 105 has a large number of cells with hardly any genes detected - should probably be excluded
+ - Sample 126 has a very low number of cells - should probably be excluded
+ - Sample 143 has a much larger number of genes detected than any of the other samples. presumably because it was sequenced to greater depth
+
+```{r tenx_qc2}
+# Remove cells with > 20% mitochondrial reads, cells from samples 105 and 126
+tenx <- subset(x = tenx, subset = percent.mt < 20 & orig.ident != 105 & orig.ident != 126)
+dim(tenx)
+```
+
+## Subset sample MGH143
+For now we'll proceed with just one sample: MGH143, which had the most reads.
+```{r subset_MGH143}
+MGH143 <- subset(x = tenx, subset = orig.ident == 143)
+```
+We will use the new `SCTransform` function in place of the standard NormalizeData, FindVariableFeatures, ScaleData workflow from Seurat v2.
+```{r MGH143_sctransform, fig.width=12, fig.height=8}
+## SCTransform
+# run sctransform if not already done
+if(!file.exists("data/Neftel_2019/MGH143_SCT.rds")){
+  MGH143 <- SCTransform(MGH143, verbose = TRUE)
+  saveRDS(MGH143_SCT, "data/Neftel_2019/MGH143_SCT.rds")
+} else {
+  MGH143 <- readRDS("data/Neftel_2019/MGH143_SCT.rds")
+}
+# These are now standard steps in the Seurat workflow for visualization and clustering
+MGH143 <- RunPCA(MGH143, verbose = TRUE)
+MGH143 <- RunUMAP(MGH143, dims = 1:30, n.components = 2, verbose = TRUE)
+MGH143 <- FindNeighbors(MGH143, dims = 1:30, verbose = TRUE)
+MGH143 <- FindClusters(MGH143, verbose = TRUE)
+DimPlot(MGH143, label = TRUE)
+```
+### 3D UMAP plot
+Quick aside: we can plot in 3D as well, by requesting UMAP to embed in 3 dimensions:
+```{r plot_UMAP_3D}
+# Embed in 3 dimensions
+MGH143_3D <- RunUMAP(MGH143, dims = 1:30, n.components = 3, verbose = TRUE)
+
+# Plot
+my_df <- Embeddings(MGH143_3D, reduction = "umap") %>%
+  as_tibble() %>%
+  mutate(cluster = MGH143_3D$seurat_clusters)
+p <- plot_ly(my_df, x = ~UMAP_1, y = ~UMAP_2, z = ~UMAP_3,
+             color = ~cluster, colors = hue_pal()(length(levels(MGH143_3D$seurat_clusters))),
+             size=1) %>%
+  add_markers() %>%
+  layout(scene = list(xaxis = list(title = 'UMAP_1'),
+                     yaxis = list(title = 'UMAP_2'),
+                     zaxis = list(title = 'UMAP_3')))
+p
+
+# Clean up
+rm(MGH143_3D, my_df, p)
+```
+### EGFR and CD45
+Quick sanity check.
+```{r sanity_check_EGFR_CD45, fig.width=12, fig.height=6}
+# EGFR and CD45
+FeaturePlot(object = MGH143, features = c("EGFR","PTPRC"), reduction= "umap", label = TRUE)
+```
+Like we saw with the Darmanis et al 2017 dataset, the immune cell population forms a distinct cluster. Remove these for now, as we're interested in looking at the expression states within the neoplastic cells. Note: following some downstream analysis, I'm not sure that cluster 10 is neoplastic cells either, we will remove cluster 10 for now.
+
+### Remove immune cells
+```{r remove_immune}
+if(!file.exists("data/Neftel_2019/MGH143_SCT_noImmune.rds")){
+  MGH143 <- subset(x = MGH143, subset = seurat_clusters != 7 & seurat_clusters != 10)
+  MGH143 <- SCTransform(MGH143, verbose = TRUE)
+  MGH143 <- RunPCA(MGH143, verbose = TRUE)
+  MGH143 <- RunUMAP(MGH143, dims = 1:30, n.components = 2, verbose = TRUE)
+  MGH143 <- FindNeighbors(MGH143, dims = 1:30, verbose = TRUE)
+  MGH143 <- FindClusters(MGH143, verbose = TRUE)
+  saveRDS(MGH143, "data/Neftel_2019/MGH143_SCT_noImmune.rds")
+} else {
+  MGH143 <- readRDS("data/Neftel_2019/MGH143_SCT_noImmune.rds")
+}
+```
+
+### Cell cycle
+Check association with cell cycle.
+```{r MGH143_cell_cycle_scoring, fig.width=16, fig.height=4}
+# Perform cell cycle scoring
+MGH143 <- CellCycleScoring(MGH143, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes)
+FeaturePlot(object = MGH143, features = c("S.Score", "G2M.Score"), reduction= "umap", blend = TRUE)
+```
+Cell cycle has a large influence, but Neftel et al identified OPC-like and NPC-like expression states contain a higher proportion of cycling cells. If we regress out the effect of cell cycle we might also remove some of the biological signal associated with these expression states. We will leave it as is for now.
+
+### Expression states in sample MGH143
+Let's try to map some of the cells to different expression states
+```{r MGH143_expression_states}
+# Import modules
+Neftel_2019_states <- read_delim("../marker_genes/data/Nefel_2019_states.tsv", "\t", escape_double = FALSE, trim_ws = TRUE)
+classical <- read_delim("../marker_genes/data/Wang_2017_classical.tsv","\t", escape_double = FALSE, trim_ws = TRUE) %>% select(GeneSymbol) %>% rename(classical=GeneSymbol)
+proneural <- read_delim("../marker_genes/data/Wang_2017_proneural.tsv","\t", escape_double = FALSE, trim_ws = TRUE) %>% select(GeneSymbol) %>% rename(proneural=GeneSymbol)
+mesenchymal <- read_delim("../marker_genes/data/Wang_2017_mesenchymal.tsv","\t", escape_double = FALSE, trim_ws = TRUE) %>% select(GeneSymbol) %>% rename(mesenchymal=GeneSymbol)
+
+# Add module scores
+MGH143 <- AddModuleScore(object = MGH143, features = Neftel_2019_states, name = colnames(Neftel_2019_states))
+MGH143 <- AddModuleScore(object = MGH143, features = classical, name = colnames(classical))
+MGH143 <- AddModuleScore(object = MGH143, features = proneural, name = colnames(proneural))
+MGH143 <- AddModuleScore(object = MGH143, features = mesenchymal, name = colnames(mesenchymal))
+
+# MES-like 1
+FeaturePlot(object = MGH143, features = c("MES12"), reduction= "umap", cols = brewer.pal(9, "Reds"), label = TRUE)
+# MES-like 2
+FeaturePlot(object = MGH143, features = c("MES21"), reduction= "umap", cols = brewer.pal(9, "Reds"), label = TRUE)
+# AC-like
+FeaturePlot(object = MGH143, features = c("AC3"), reduction= "umap", cols = brewer.pal(9, "YlOrBr"), label = TRUE)
+# OPC-like
+FeaturePlot(object = MGH143, features = c("OPC4"), reduction= "umap", cols = brewer.pal(9, "Greens"), label = TRUE)
+# NPC-like 1
+FeaturePlot(object = MGH143, features = c("NPC15"), reduction= "umap", cols = brewer.pal(9, "Blues"), label = TRUE)
+# NPC-like 2
+FeaturePlot(object = MGH143, features = c("NPC26"), reduction= "umap", cols = brewer.pal(9, "Blues"), label = TRUE)
+
+# Wang et al subtypes
+FeaturePlot(object = MGH143, features = c("classical1"), reduction= "umap", cols = brewer.pal(9, "Blues"), label = TRUE)
+FeaturePlot(object = MGH143, features = c("proneural1"), reduction= "umap", cols = brewer.pal(9, "Greens"), label = TRUE)
+FeaturePlot(object = MGH143, features = c("mesenchymal1"), reduction= "umap", cols = brewer.pal(9, "Reds"), label = TRUE)
+```
+
+## Integrate all 10x samples
+Now that we've looked at one sample, let's integrate the remaining samples and study all of the cells together. We'll do this using Seurat v3's integration capabilities.
+```{r integrate_all_tenx}
+# Integrate datasets if not already done
+if(!file.exists("data/Neftel_2019/tenx_integrated.rds")){
+# Create a list of Seurat objects to integrate
+tenx.list <- SplitObject(tenx, split.by = "orig.ident")
+# run SCTransform on each object separately
+for (i in 1:length(tenx.list)) {
+    tenx.list[[i]] <- SCTransform(tenx.list[[i]], verbose = TRUE, return.only.var.genes=FALSE)
+}
+# select features for downstream integration
+tenx.features <- SelectIntegrationFeatures(object.list = tenx.list, nfeatures = 3000)
+# run PrepSCTIntegration, which ensures that all necessary Pearson residuals have been calculated
+tenx.list <- PrepSCTIntegration(object.list = tenx.list, anchor.features = tenx.features, verbose = TRUE)
+# identify anchors
+tenx.anchors <- FindIntegrationAnchors(object.list = tenx.list, normalization.method = "SCT", anchor.features = tenx.features, verbose = FALSE)
+# integrate the datasets
+tenx.integrated <- IntegrateData(anchorset = tenx.anchors, normalization.method = "SCT", verbose = FALSE)
+# proceed with downstream analysis (i.e. visualization, clustering) on the integrated dataset
+tenx.integrated <- RunPCA(tenx.integrated, verbose = TRUE)
+tenx.integrated <- RunUMAP(tenx.integrated, dims = 1:30)
+saveRDS(tenx.integrated, "data/Neftel_2019/tenx_integrated.rds")
+} else {
+  tenx.integrated <- readRDS("data/Neftel_2019/tenx_integrated.rds")
+}
+# Find clusters
+tenx.integrated <- FindNeighbors(tenx.integrated, dims = 1:30, verbose = TRUE)
+tenx.integrated <- FindClusters(tenx.integrated, verbose = TRUE)
+
+# Plot UMAP
+DimPlot(tenx.integrated, label = TRUE)
+DimPlot(tenx.integrated, group.by = c("orig.ident"))
+DimPlot(tenx.integrated, split.by = c("orig.ident"), ncol = 2)
+
+# Distinguish tumour from immune cell population
+FeaturePlot(object = tenx.integrated, features = c("EGFR","PTPRC"), reduction= "umap", slot="scale.data")
+# The cluster on the left appears to be the neoplastic cells, the cluster on the right appears to be the immune cells
+
+# Add module scores and save out - if not already done
+if(!file.exists("data/Neftel_2019/tenx_integrated_ModScore.rds")){
+  # The AddModuleScore function was working using the integrated data which contains 3000 rows, so most of the genes from the modules were missing, so I changed the active assay to SCT
+  DefaultAssay(object = tenx.integrated) <- "SCT"
+  tenx.integrated <- AddModuleScore(object = tenx.integrated, features = Neftel_2019_states, name = colnames(Neftel_2019_states))
+  tenx.integrated <- AddModuleScore(object = tenx.integrated, features = classical, name = colnames(classical))
+  tenx.integrated <- AddModuleScore(object = tenx.integrated, features = proneural, name = colnames(proneural))
+  tenx.integrated <- AddModuleScore(object = tenx.integrated, features = mesenchymal, name = colnames(mesenchymal))
+  tenx.integrated <- CellCycleScoring(tenx.integrated, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes)
+  saveRDS(tenx.integrated, "data/Neftel_2019/tenx_integrated_ModScore.rds")
+} else {
+  tenx.integrated <- readRDS("data/Neftel_2019/tenx_integrated_ModScore.rds") 
+}
+
+## Plot module scores
+# Cluster 4 seems to capture the cycling neoplastic cells
+FeaturePlot(object = tenx.integrated, features = c("S.Score", "G2M.Score"), reduction= "umap", label = TRUE)
+# Neftel et al subtypes
+FeaturePlot(object = tenx.integrated, features = c("MES12"), reduction= "umap", cols = brewer.pal(9, "Reds"))
+FeaturePlot(object = tenx.integrated, features = c("MES21"), reduction= "umap", cols = brewer.pal(9, "Reds"))
+FeaturePlot(object = tenx.integrated, features = c("AC3"), reduction= "umap", cols = brewer.pal(9, "YlOrBr"))
+FeaturePlot(object = tenx.integrated, features = c("OPC4"), reduction= "umap", cols = brewer.pal(9, "Greens"))
+FeaturePlot(object = tenx.integrated, features = c("NPC15"), reduction= "umap", cols = brewer.pal(9, "Blues"))
+FeaturePlot(object = tenx.integrated, features = c("NPC26"), reduction= "umap", cols = brewer.pal(9, "Blues"))
+# Wang et al subtypes
+FeaturePlot(object = tenx.integrated, features = c("classical1"), reduction= "umap", cols = brewer.pal(9, "Blues"), label = TRUE)
+FeaturePlot(object = tenx.integrated, features = c("proneural1"), reduction= "umap", cols = brewer.pal(9, "Greens"), label = TRUE)
+FeaturePlot(object = tenx.integrated, features = c("mesenchymal1"), reduction= "umap", cols = brewer.pal(9, "Reds"), label = TRUE)
+```
+
+### Remove immune cells
+```{r}
+# Remove clusters 14, 8, 15, 1, 5, 9 & 10
+if(!file.exists("data/Neftel_2019/tenx_integrated_ModScore_noImmune.rds")){
+  tenx.integrated <- subset(x = tenx.integrated, subset = seurat_clusters != 14 & seurat_clusters != 8 & seurat_clusters != 15 & seurat_clusters != 1 & seurat_clusters != 5 & seurat_clusters != 9 & seurat_clusters != 10 & seurat_clusters != 7)
+  saveRDS(tenx.integrated, "data/Neftel_2019/tenx_integrated_ModScore_noImmune.rds")
+} else {
+  tenx.integrated <- readRDS("data/Neftel_2019/tenx_integrated_ModScore_noImmune.rds") 
+}
+
+DefaultAssay(object = tenx.integrated) <- "integrated"
+tenx.integrated <- RunPCA(tenx.integrated, verbose = TRUE)
+tenx.integrated <- RunUMAP(tenx.integrated, dims = 1:30)
+tenx.integrated <- FindNeighbors(tenx.integrated, dims = 1:30, verbose = TRUE)
+tenx.integrated <- FindClusters(tenx.integrated, verbose = TRUE)
+
+# Plot UMAP
+DimPlot(tenx.integrated, label = TRUE)
+DimPlot(tenx.integrated, group.by = c("orig.ident"))
+DimPlot(tenx.integrated, split.by = c("orig.ident"), ncol = 2)
+
+## Plot module scores
+# Cluster 4 seems to capture the cycling neoplastic cells
+FeaturePlot(object = tenx.integrated, features = c("S.Score", "G2M.Score"), reduction= "umap", label = TRUE)
+# Neftel et al subtypes
+FeaturePlot(object = tenx.integrated, features = c("OPC4"), reduction= "umap", cols = brewer.pal(9, "YlGn"))
+FeaturePlot(object = tenx.integrated, features = c("AC3"), reduction= "umap", cols = brewer.pal(9, "YlOrBr"))
+FeaturePlot(object = tenx.integrated, features = c("MES12"), reduction= "umap", cols = brewer.pal(9, "YlOrRd"))
+FeaturePlot(object = tenx.integrated, features = c("MES21"), reduction= "umap", cols = brewer.pal(9, "YlOrRd"))
+FeaturePlot(object = tenx.integrated, features = c("NPC26"), reduction= "umap", cols = brewer.pal(9, "PuBu"))
+FeaturePlot(object = tenx.integrated, features = c("NPC15"), reduction= "umap", cols = brewer.pal(9, "PuBu"))
+# Wang et al subtypes
+FeaturePlot(object = tenx.integrated, features = c("classical1"), reduction= "umap", cols = brewer.pal(9, "PuBu"), label = TRUE)
+FeaturePlot(object = tenx.integrated, features = c("proneural1"), reduction= "umap", cols = brewer.pal(9, "Greens"), label = TRUE)
+FeaturePlot(object = tenx.integrated, features = c("mesenchymal1"), reduction= "umap", cols = brewer.pal(9, "Reds"), label = TRUE)
+```
+
+# Process Smart-seq2 data {#anchor_4}
+```{r import_SmartSeq2_seurat}
+smartseq <- readRDS("data/Neftel_2019/smartseq.rds")
+```
+
+## Inspect Smart-seq2 data
+Have a quick look at what the object contains.
+```{r glance_smartseq_seurat}
+# Have a quick look at some of the data
+smartseq@assays$RNA[1:10,1:10]
+
+# Dimensions?
+dim(smartseq)
+# how many samples are present?
+samples <- str_split_fixed(colnames(smartseq), "-", 2)[,1]
+length(table(samples))
+# How many cells?
+length(samples)
+# ~ how many cells/sample?
+table(samples)
+plot(sort(table(samples)), las=2, xlab="", main=glue('mean # cells/ sample {round(mean(table(samples)))}')); abline(h=mean(table(samples)), col="red", lty=2)
+
+# The file from which this Seurat object was created "GSM3828672_Smartseq2_GBM_IDHwt_processed_TPM.tsv.gz" suggests the values should be TPM
+head(smartseq[[]])
+# But nCount_RNA (colSum of the expression counts) is not 1 million - for TPM it should be. If we look at this across all of the cells:
+plot(unlist((smartseq[["nCount_RNA"]])), col=as.factor(samples))
+# I'm not sure what these units are but they aren't TPM
+
+# What do the Smart-seq2 cell names look like?
+head(colnames(smartseq))
+# "MGH101" is a patient sample, "P1" is probably the plate & "A04" is probably the well
+
+# What do the gene names look like?
+head(rownames(smartseq))
+# How many genes?
+length(rownames(smartseq))
+
+# How many adult vs pediatric samples?
+metadata %>% filter(str_detect(metadata$`processed data file`, "Smartseq2")) %>% group_by(`tumour name`, `adult/pediatric`) %>% count %>% select(-n) %>% arrange %>% table
+```
+
+## Add metadata
+Change the cell identity to the patient sample name e.g. "MGH101" and add a metadata adult_pediatric metadata column.
+```{r}
+# Change cell identity to patient sample name
+smartseq <- SetIdent(smartseq, value = samples)
+# Add metadata column with info about whether sample is adult or pediatric
+smartseq$adult_pediatric <- metadata$`adult/pediatric`[match(colnames(smartseq), metadata$`Sample name`)]
+```
+
+## QC
+Visualise QC metrics, and use these to filter cells.
+```{r SmartSeq2_qc, fig.height=7, fig.width=13}
+# When i search for mitochondrial genes ("^MT-") there were none, so can't use this QC metric
+# Show QC metrics for the first 5 cells
+head(x = smartseq@meta.data, 5)
+
+#Visualize QC metrics as a violin plot
+VlnPlot(object = smartseq, features = c("nFeature_RNA"), ncol = 2)
+```
+Exclude samples with <100 cells
+```{r exclude_smartseq_samples}
+# Remove samples with less than 100 cells
+smartseq$keep <- !Idents(smartseq)%in%names(which(table(Idents(smartseq))<100))
+smartseq <- subset(x = smartseq, subset = keep == TRUE)
+
+# Restrict to samples that aren't "pos" or "neg"
+smartseq$keep <- Idents(smartseq)%in%metadata$`tumour name`
+smartseq <- subset(x = smartseq, subset = keep == TRUE)
+
+dim(smartseq)
+```
+
+## Integrate all SmartSeq2 samples
+```{r integrate_all_smartseq}
+# Integrate datasets if not already done
+if(!file.exists("data/Neftel_2019/SmartSeq2_integrated.rds")){
+# Create a list of Seurat objects to integrate
+smartseq.list <- SplitObject(smartseq, split.by = "ident")
+
+# Restrict to two samples for now
+smartseq.list <- c(smartseq.list[[1]],smartseq.list[[2]])
+
+# run SCTransform on each object separately
+for (i in 1:length(smartseq.list)) {
+    smartseq.list[[i]] <- SCTransform(smartseq.list[[i]], verbose = TRUE, return.only.var.genes=FALSE)
+}
+# select features for downstream integration
+smartseq.features <- SelectIntegrationFeatures(object.list = smartseq.list, nfeatures = 3000)
+# run PrepSCTIntegration, which ensures that all necessary Pearson residuals have been calculated
+smartseq.list <- PrepSCTIntegration(object.list = smartseq.list, anchor.features = smartseq.features, verbose = TRUE)
+# identify anchors - will give this error "Cannot find more nearest neighbours than there are points" because some samples have a small number of cells, so we set k.filter argument to NA
+smartseq.anchors <- FindIntegrationAnchors(object.list = smartseq.list, normalization.method = "SCT", anchor.features = smartseq.features, verbose = TRUE, k.filter = NA)
+# integrate the datasets (integrate ALL genes)
+all_genes <- lapply(smartseq.list, row.names) %>% Reduce(intersect, .) # get gene names present in ALL SCTransform'd datasets
+smartseq.integrated <- IntegrateData(anchorset = smartseq.anchors, normalization.method = "SCT", verbose = TRUE, features.to.integrate = all_genes)
+
+### Throwing an error when we try use all_genes, waiting on Seurat author's response to GitHub issue
+
+# proceed with downstream analysis on the integrated dataset
+smartseq.integrated <- RunPCA(smartseq.integrated, verbose = TRUE)
+smartseq.integrated <- RunUMAP(smartseq.integrated, dims = 1:30)
+# Find clusters
+smartseq.integrated <- FindNeighbors(smartseq.integrated, dims = 1:30, verbose = TRUE)
+smartseq.integrated <- FindClusters(smartseq.integrated, verbose = TRUE)
+saveRDS(smartseq.integrated, "data/Neftel_2019/SmartSeq2_integrated.rds")
+} else {
+  smartseq.integrated <- readRDS("data/Neftel_2019/SmartSeq2_integrated.rds")
+}
+
+# Add sample name as a metadata column
+smartseq.integrated$sample_id <- str_split_fixed(colnames(smartseq.integrated), "-", 2)[,1]
+
+# Plot UMAP
+DimPlot(smartseq.integrated, label = TRUE)
+DimPlot(smartseq.integrated, group.by = c("sample_id"))
+DimPlot(smartseq.integrated, group.by = c("adult_pediatric"))
+DimPlot(smartseq.integrated, split.by = c("orig.ident"), ncol = 2)
+
+# Distinguish tumour from immune cell population
+DefaultAssay(object = smartseq.integrated) <- "SCT"
+FeaturePlot(object = smartseq.integrated, features = c("EGFR","PTPRC"), reduction= "umap")
+DefaultAssay(object = smartseq.integrated) <- "integrated"
+# The cluster on the left appears to be the neoplastic cells, the cluster on the right appears to be the immune cells
+
+# Add module scores and save out - if not already done
+if(!file.exists("data/Neftel_2019/smartseq.integrated_ModScore.rds")){
+  # The AddModuleScore function was working using the integrated data which contains 3000 rows, so most of the genes from the modules were missing, so I changed the active assay to SCT
+  DefaultAssay(object = smartseq.integrated) <- "SCT"
+  smartseq.integrated <- AddModuleScore(object = smartseq.integrated, features = Neftel_2019_states, name = colnames(Neftel_2019_states))
+  smartseq.integrated <- AddModuleScore(object = smartseq.integrated, features = classical, name = colnames(classical))
+  smartseq.integrated <- AddModuleScore(object = smartseq.integrated, features = proneural, name = colnames(proneural))
+  smartseq.integrated <- AddModuleScore(object = smartseq.integrated, features = mesenchymal, name = colnames(mesenchymal))
+  smartseq.integrated <- CellCycleScoring(smartseq.integrated, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes)
+  saveRDS(smartseq.integrated, "data/Neftel_2019/smartseq.integrated_ModScore.rds")
+} else {
+  smartseq.integrated <- readRDS("data/Neftel_2019/smartseq.integrated_ModScore.rds") 
+}
+
+## Plot module scores
+# Cluster 4 seems to capture the cycling neoplastic cells
+FeaturePlot(object = smartseq.integrated, features = c("S.Score", "G2M.Score"), reduction= "umap", label = TRUE)
+# Wang et al subtypes
+FeaturePlot(object = smartseq.integrated, features = c("classical1"), reduction= "umap", cols = brewer.pal(9, "Blues"), label = TRUE)
+FeaturePlot(object = smartseq.integrated, features = c("proneural1"), reduction= "umap", cols = brewer.pal(9, "Greens"), label = TRUE)
+FeaturePlot(object = smartseq.integrated, features = c("mesenchymal1"), reduction= "umap", cols = brewer.pal(9, "Reds"), label = TRUE)
+# Neftel et al subtypes
+FeaturePlot(object = smartseq.integrated, features = c("OPC4"), reduction= "umap", cols = brewer.pal(9, "YlGn"))
+FeaturePlot(object = smartseq.integrated, features = c("AC3"), reduction= "umap", cols = brewer.pal(9, "YlOrBr"))
+FeaturePlot(object = smartseq.integrated, features = c("MES12"), reduction= "umap", cols = brewer.pal(9, "YlOrRd"))
+FeaturePlot(object = smartseq.integrated, features = c("MES21"), reduction= "umap", cols = brewer.pal(9, "YlOrRd"))
+FeaturePlot(object = smartseq.integrated, features = c("NPC26"), reduction= "umap", cols = brewer.pal(9, "PuBu"))
+FeaturePlot(object = smartseq.integrated, features = c("NPC15"), reduction= "umap", cols = brewer.pal(9, "PuBu"))
+```
+It might be an idea to inspect the modules scores themselves and how they vary across samples
+
+```{r, fig.width=14, fig.height=6}
+par(mar=c(0,4,0,0))
+par(mfrow=c(2,1))
+# Plot MES1 scores, coloured by sample
+plot(smartseq.integrated$MES12, col=as.factor(str_split_fixed(colnames(smartseq.integrated), "-",2)[,1]), pch=16, xaxt="n", xlab="n", ylab="MES1 module scores")
+# Plot MES1 scores, coloured by plate
+plot(smartseq.integrated$MES12, col=as.factor(str_split_fixed(colnames(smartseq.integrated), "-",3)[,2]), pch=16, xaxt="n", xlab="n", ylab="MES1 module scores")
+par(mfrow=c(1,1))
+
+```
+
+## Inspect a single SmartSeq2 sample
+```{r MGH66}
+# Subset just the sample MGH66
+MGH66 <- subset(x = smartseq, idents = "MGH66")
+# run sctransform
+MGH66 <- suppressWarnings(SCTransform(MGH66, verbose = FALSE, return.only.var.genes = FALSE))
+# Run PCA
+MGH66 <- RunPCA(MGH66, verbose = FALSE)
+# Run UMAP
+MGH66 <- RunUMAP(MGH66, dims = 1:30, verbose = FALSE)
+# Find clusters
+MGH66 <- FindNeighbors(MGH66, dims = 1:30, verbose = FALSE)
+MGH66 <- FindClusters(MGH66, verbose = FALSE)
+# Plot
+DimPlot(MGH66, label = TRUE) + NoLegend()
+# Detect modules
+MGH66 <- AddModuleScore(object = MGH66, features = Neftel_2019_states, name = colnames(Neftel_2019_states))
+MGH66 <- CellCycleScoring(MGH66, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes)
+
+## Plot module scores
+FeaturePlot(object = MGH66, features = c("S.Score", "G2M.Score"), reduction= "umap", label = TRUE)
+# Neftel et al subtypes
+FeaturePlot(object = MGH66, features = c("AC3"), reduction= "umap", cols = brewer.pal(9, "YlOrBr"))
+FeaturePlot(object = MGH66, features = c("MES12"), reduction= "umap", cols = brewer.pal(9, "YlOrRd"))
+FeaturePlot(object = MGH66, features = c("MES21"), reduction= "umap", cols = brewer.pal(9, "YlOrRd"))
+FeaturePlot(object = MGH66, features = c("OPC4"), reduction= "umap", cols = brewer.pal(9, "YlGn"))
+FeaturePlot(object = MGH66, features = c("NPC26"), reduction= "umap", cols = brewer.pal(9, "PuBu"))
+FeaturePlot(object = MGH66, features = c("NPC15"), reduction= "umap", cols = brewer.pal(9, "PuBu"))
+```
+
+
+
